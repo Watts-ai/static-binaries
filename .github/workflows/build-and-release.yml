@@ -1,0 +1,187 @@
+name: Build and Release Static Binaries
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:latest
+    strategy:
+      matrix:
+        include:
+          - package: socat
+            binary: socat1
+            output: socat
+      fail-fast: false
+
+    steps:
+      # 1. Install dependencies required for GitHub Actions and the Build
+      - name: Install System Dependencies
+        run: apk add --no-cache git nodejs github-cli sudo alpine-sdk file bash
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get package version from APKBUILD
+        id: get-version
+        run: |
+          # Clone Alpine aports (shallow)
+          git clone --depth 1 https://github.com/alpinelinux/aports.git /tmp/aports
+
+          # Find the APKBUILD
+          APKBUILD_PATH=$(find /tmp/aports -name APKBUILD | grep "/${{ matrix.package }}/APKBUILD" | head -n 1)
+
+          if [ -z "$APKBUILD_PATH" ]; then
+            echo "Error: APKBUILD not found for ${{ matrix.package }}"
+            exit 1
+          fi
+
+          # Extract version
+          VERSION=$(grep -E '^pkgver=' "$APKBUILD_PATH" | cut -d= -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Package: ${{ matrix.package }}, Version: $VERSION"
+
+      - name: Check if release exists
+        id: check-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.get-version.outputs.version }}"
+          RELEASE_TAG="${{ matrix.package }}-v${VERSION}"
+
+          if gh release view "$RELEASE_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "needs_build=false" >> $GITHUB_OUTPUT
+            echo "Release $RELEASE_TAG already exists, skipping."
+          else
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "Release $RELEASE_TAG does not exist, building."
+          fi
+
+      - name: Build static binary
+        if: steps.check-release.outputs.needs_build == 'true'
+        run: |
+          # Setup Builder User (abuild cannot run as root)
+          adduser -D builder
+          addgroup builder abuild
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          
+          # Prepare output directory
+          OUTPUT_DIR="$(pwd)/output"
+          mkdir -p "$OUTPUT_DIR"
+          chown builder:builder "$OUTPUT_DIR"
+
+          # ------------------------------------------------------------------
+          # Write build logic to a script file.
+          # Using 'EOF' (quoted) prevents the Runner from expanding variables.
+          # ------------------------------------------------------------------
+          cat << 'EOF' > /tmp/build_script.sh
+          set -e
+
+          PKG="${1}"
+          OUTPUT_DIR="${2}"
+          BINARY_NAME="${3}"
+          OUTPUT_NAME="${4}"
+
+          # Setup Keys
+          abuild-keygen -a -i -n
+
+          # Update APK cache
+          sudo apk update
+
+          # Install static library dependencies
+          sudo apk add --no-cache musl-dev
+
+          # Clone Aports
+          git clone --depth 1 https://github.com/alpinelinux/aports.git /home/builder/aports
+          echo "Building $PKG..."
+
+          # Find Package Path
+          PKG_PATH=$(find /home/builder/aports -name APKBUILD | grep "/$PKG/APKBUILD" | head -n 1 | xargs dirname)
+          if [ -z "$PKG_PATH" ]; then echo "Package not found"; exit 1; fi
+          
+          cd "$PKG_PATH"
+
+          # Force Static Linking
+          echo "Original APKBUILD build function:"
+          sed -n '/^build()/,/^}/p' APKBUILD
+
+          # Replace or modify configure flags to enable static linking
+          # For socat and most autotools packages, we need to pass LDFLAGS
+          # Use -static and -no-pie to create truly static binaries without dynamic linker
+          sed -i 's/\.\/configure /LDFLAGS="-static -no-pie" CFLAGS="$CFLAGS -static" .\/configure --enable-static --disable-shared /' APKBUILD
+
+          # If that pattern doesn't match, try a more general approach
+          if ! grep -q "LDFLAGS.*-static" APKBUILD; then
+            sed -i '/build() {/a \    export LDFLAGS="$LDFLAGS -static -no-pie"' APKBUILD
+            sed -i '/build() {/a \    export CFLAGS="$CFLAGS -static"' APKBUILD
+          fi
+
+          echo "Modified APKBUILD build function:"
+          sed -n '/^build()/,/^}/p' APKBUILD
+
+          # Build
+          abuild -r
+
+          # Extract Binary
+          echo ">> Installing and extracting binary..."
+
+          # Install the built package
+          APK_FILE=$(find ~/packages -name "$PKG-*.apk" -type f | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "Error: APK file not found"
+            exit 1
+          fi
+
+          echo "Installing $APK_FILE"
+          sudo apk add --allow-untrusted "$APK_FILE"
+
+          # Find and copy the binary
+          BINARY_PATH=$(which "$BINARY_NAME" 2>/dev/null || find /usr/bin /usr/sbin /bin /sbin -name "$BINARY_NAME" -type f 2>/dev/null | head -n 1)
+
+          if [ -z "$BINARY_PATH" ]; then
+            echo "Error: Binary '$BINARY_NAME' not found after installation"
+            exit 1
+          fi
+
+          echo "Found binary at: $BINARY_PATH"
+          cp -v "$BINARY_PATH" "$OUTPUT_DIR/$OUTPUT_NAME"
+          EOF
+          # ------------------------------------------------------------------
+
+          # Make script executable and run as builder
+          chmod +x /tmp/build_script.sh
+          # Pass the package name, output directory, binary name, and output name as arguments
+          su builder -c "/tmp/build_script.sh ${{ matrix.package }} '$OUTPUT_DIR' ${{ matrix.binary }} ${{ matrix.output }}"
+
+      - name: Verify binary
+        if: steps.check-release.outputs.needs_build == 'true'
+        run: |
+          if [ -f output/${{ matrix.output }} ]; then
+            ls -lh output/${{ matrix.output }}
+            file output/${{ matrix.output }} | grep "statically linked" || (echo "Error: Not static" && exit 1)
+          else
+            echo "Binary not found!"
+            exit 1
+          fi
+
+      - name: Create Release
+        if: steps.check-release.outputs.needs_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.get-version.outputs.version }}"
+          RELEASE_TAG="${{ matrix.package }}-v${VERSION}"
+
+          gh release create "$RELEASE_TAG" \
+            --repo ${{ github.repository }} \
+            --title "${{ matrix.package }} v${VERSION}" \
+            --notes "Static build of ${{ matrix.package }} v${VERSION} for Linux x86_64 (Alpine)" \
+            output/${{ matrix.output }}
