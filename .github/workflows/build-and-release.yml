@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     container:
       image: alpine:latest
     strategy:
@@ -20,6 +20,13 @@ jobs:
           - package: socat
             binary: socat1
             output: socat
+            arch: x86_64
+            runner: ubuntu-latest
+          - package: socat
+            binary: socat1
+            output: socat
+            arch: aarch64
+            runner: ubuntu-24.04-arm
       fail-fast: false
 
     steps:
@@ -49,20 +56,21 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Package: ${{ matrix.package }}, Version: $VERSION"
 
-      - name: Check if release exists
+      - name: Check if asset exists
         id: check-release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.get-version.outputs.version }}"
           RELEASE_TAG="${{ matrix.package }}-v${VERSION}"
+          ASSET_NAME="${{ matrix.output }}-${{ matrix.arch }}"
 
-          if gh release view "$RELEASE_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" --repo ${{ github.repository }} --json assets --jq ".assets[].name" | grep -q "^$ASSET_NAME$"; then
             echo "needs_build=false" >> $GITHUB_OUTPUT
-            echo "Release $RELEASE_TAG already exists, skipping."
+            echo "Asset $ASSET_NAME already exists in $RELEASE_TAG, skipping."
           else
             echo "needs_build=true" >> $GITHUB_OUTPUT
-            echo "Release $RELEASE_TAG does not exist, building."
+            echo "Asset $ASSET_NAME not found in $RELEASE_TAG (or release doesn't exist), building."
           fi
 
       - name: Build static binary
@@ -159,29 +167,35 @@ jobs:
           # Make script executable and run as builder
           chmod +x /tmp/build_script.sh
           # Pass the package name, output directory, binary name, and output name as arguments
-          su builder -c "/tmp/build_script.sh ${{ matrix.package }} '$OUTPUT_DIR' ${{ matrix.binary }} ${{ matrix.output }}"
+          su builder -c "/tmp/build_script.sh ${{ matrix.package }} '$OUTPUT_DIR' ${{ matrix.binary }} ${{ matrix.output }}-${{ matrix.arch }}"
 
       - name: Verify binary
         if: steps.check-release.outputs.needs_build == 'true'
         run: |
-          if [ -f output/${{ matrix.output }} ]; then
-            ls -lh output/${{ matrix.output }}
-            file output/${{ matrix.output }} | grep "statically linked" || (echo "Error: Not static" && exit 1)
+          ASSET_PATH="output/${{ matrix.output }}-${{ matrix.arch }}"
+          if [ -f "$ASSET_PATH" ]; then
+            ls -lh "$ASSET_PATH"
+            file "$ASSET_PATH" | grep "statically linked" || (echo "Error: Not static" && exit 1)
           else
             echo "Binary not found!"
             exit 1
           fi
 
-      - name: Create Release
+      - name: Create or Update Release
         if: steps.check-release.outputs.needs_build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.get-version.outputs.version }}"
           RELEASE_TAG="${{ matrix.package }}-v${VERSION}"
+          ASSET_PATH="output/${{ matrix.output }}-${{ matrix.arch }}"
 
+          # Create release if it doesn't exist (fails if it exists, so we ignore error)
           gh release create "$RELEASE_TAG" \
             --repo ${{ github.repository }} \
             --title "${{ matrix.package }} v${VERSION}" \
-            --notes "Static build of ${{ matrix.package }} v${VERSION} for Linux x86_64 (Alpine)" \
-            output/${{ matrix.output }}
+            --notes "Static builds of ${{ matrix.package }} v${VERSION} (Alpine)" \
+            2>/dev/null || true
+
+          # Upload the asset
+          gh release upload "$RELEASE_TAG" "$ASSET_PATH" --repo ${{ github.repository }} --clobber
