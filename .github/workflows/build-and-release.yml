@@ -27,6 +27,16 @@ jobs:
             output: socat
             arch: aarch64
             runner: ubuntu-24.04-arm
+          - package: strace
+            binary: strace
+            output: strace
+            arch: x86_64
+            runner: ubuntu-latest
+          - package: strace
+            binary: strace
+            output: strace
+            arch: aarch64
+            runner: ubuntu-24.04-arm
       fail-fast: false
 
     steps:
@@ -121,6 +131,9 @@ jobs:
           echo "Original APKBUILD build function:"
           sed -n '/^build()/,/^}/p' APKBUILD
 
+          # Remove -dbg subpackage (fails with static builds due to missing subpkgdir)
+          sed -i 's/\$pkgname-dbg//g' APKBUILD
+
           # Replace or modify configure flags to enable static linking
           # For socat and most autotools packages, we need to pass LDFLAGS
           # Use -static and -no-pie to create truly static binaries without dynamic linker
@@ -142,7 +155,7 @@ jobs:
           echo ">> Installing and extracting binary..."
 
           # Install the built package
-          APK_FILE=$(find ~/packages -name "$PKG-*.apk" -type f | head -n 1)
+          APK_FILE=$(find ~/packages -name "$PKG-[0-9]*.apk" -type f | head -n 1)
           if [ -z "$APK_FILE" ]; then
             echo "Error: APK file not found"
             exit 1
