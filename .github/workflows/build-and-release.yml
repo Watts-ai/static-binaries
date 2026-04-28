@@ -22,21 +22,11 @@ jobs:
             output: socat
             arch: x86_64
             runner: ubuntu-latest
-          - package: socat
-            binary: socat1
-            output: socat
-            arch: aarch64
-            runner: ubuntu-24.04-arm
           - package: strace
             binary: strace
             output: strace
             arch: x86_64
             runner: ubuntu-latest
-          - package: strace
-            binary: strace
-            output: strace
-            arch: aarch64
-            runner: ubuntu-24.04-arm
       fail-fast: false
 
     steps:
